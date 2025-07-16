@@ -1,4 +1,5 @@
 import gradio as gr
+import whisper
 from tempfile import NamedTemporaryFile
 import os
 import asyncio
@@ -9,30 +10,16 @@ from langchain_groq import ChatGroq
 from langchain.agents import create_sql_agent
 from langchain.agents.agent_toolkits import SQLDatabaseToolkit
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from faster_whisper import WhisperModel
-
 os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY", "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")
 os.environ["GROQ_API_KEY"] = os.getenv("GROQ_API_KEY", "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")
-
-ffmpeg_path = r"C:\\Users\\ICG0148\\Downloads\\ffmpeg-7.1.1-full_build\\ffmpeg-7.1.1-full_build\\bin"
+ffmpeg_path = r"C:\Users\ICG0148\Downloads\ffmpeg-7.1.1-full_build\ffmpeg-7.1.1-full_build\bin"
 if ffmpeg_path not in os.environ["PATH"]:
     os.environ["PATH"] += os.pathsep + ffmpeg_path
-
-from huggingface_hub import snapshot_download
-
-model_path = snapshot_download(
-    repo_id="Systran/faster-whisper-medium",
-    local_dir="faster-whisper-medium",
-    local_dir_use_symlinks=False
-)
-
-whisper_model = WhisperModel(model_path, device="cpu", compute_type="int8", local_files_only=True)
-
-
-
 llm = ChatGroq(api_key=os.environ["GROQ_API_KEY"], model="llama3-8b-8192")
+whisper_model = whisper.load_model("large-v3")
 
-custom_table_info = { "company_master": """
+
+custom_table_info = {"company_master": """
         This table contains master data for publicly traded companies.
         IMPORTANT COLUMNS:
         - comp_name: The full, official name of the company exactly as stored in the database. DO NOT guess or shorten the name.
@@ -63,16 +50,15 @@ custom_table_info = { "company_master": """
         - type: Filing type ('C' for Consolidated).
         - no_of_months: Duration covered (3, 6, 12).
         - ebitda, net_sales, total_income, profit_after_tax, debt_equity_ratio , gross_npa,operating_profit_percent: Financial metrics/data/information.
-    """}
-
+    """
+}
 db = SQLDatabase.from_uri(
-    "postgresql+psycopg2://postgres:Anarza%40123@localhost:5432/financialdata",
+   ("postgresql+psycopg2://postgres:Anarza%40123@localhost:5432/financialdata"),
     include_tables=["company_master", "company_additional_details", "quarterly_results"],
     sample_rows_in_table_info=0,
     custom_table_info=custom_table_info
 )
-
-system_message ="""
+system_message = """
 You are a world-class PostgreSQL expert data analyst and a friendly financial assistant.
 You will answer user questions about financial data by running SQL queries against a database.
 You have access to a set of tools to interact with the database.
@@ -232,17 +218,19 @@ WHERE
 ---
 """
 
-prompt = ChatPromptTemplate.from_messages([
-    ("system", system_message),
-    ("human", "{input}"),
-    MessagesPlaceholder(variable_name="agent_scratchpad"),
-])
+prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", system_message),
+        ("human", "{input}"),
+        MessagesPlaceholder(variable_name="agent_scratchpad"), 
+    ]
+)
 
 toolkit = SQLDatabaseToolkit(db=db, llm=llm)
 agent_executor = create_sql_agent(
     llm=llm,
     toolkit=toolkit,
-    prompt=prompt,
+    prompt=prompt,  
     verbose=True,
     agent_type="openai-tools",
     handle_parsing_errors=True
@@ -257,16 +245,18 @@ def correct_transcription(text):
     }
     lower_text = text.lower()
     for wrong, right in corrections.items():
-        lower_text = lower_text.replace(wrong, right)
+        if wrong in lower_text:
+            lower_text = lower_text.replace(wrong, right)
     return lower_text.capitalize()
 
 def speech_to_text(audio_path):
     if not audio_path:
         return ""
-    print(f"Transcribing: {audio_path}")
-    segments, _ = whisper_model.transcribe(audio_path, language="en")
-    raw_text = " ".join([seg.text for seg in segments])
-    return correct_transcription(raw_text)
+    print(f"Transcribing audio from: {audio_path}")
+    raw_text = whisper_model.transcribe(audio_path)["text"]
+    corrected_text = correct_transcription(raw_text)
+    print(f"Transcription: '{raw_text}' -> Corrected: '{corrected_text}'")
+    return corrected_text
 
 async def _text_to_speech_async(text, output_path):
     voice = "en-IN-NeerjaNeural"
@@ -280,14 +270,12 @@ def text_to_speech(text):
     output_path = output_file.name
     output_file.close()
 
-    print(f"Speaking: {text}")
+    print(f"Generating speech for: '{text}'")
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(_text_to_speech_async(text, output_path))
+        asyncio.run(_text_to_speech_async(text, output_path))
+        print(f"Speech saved to: {output_path}")
         return output_path
     except Exception as e:
-        print(f"TTS Error: {e}")
         return None
 
 @traceable(name="financial_chatbot_pipeline")
@@ -295,34 +283,36 @@ def chatbot_pipeline(audio_path):
     try:
         transcription = speech_to_text(audio_path)
         if not transcription.strip():
-            return "Could not understand audio.", "Please speak clearly.", None
+            return "Could not understand audio.", "I didn't catch that. Could you please speak clearly?", None
         result = agent_executor.invoke({"input": transcription})
         response_text = result["output"]
+        print(f"Agent Response: {response_text}")
         response_audio = text_to_speech(response_text)
         return transcription, response_text, response_audio
     except Exception as e:
-        print(f"Pipeline Error: {e}")
-        error_text = "Sorry, there was a technical issue. Please try again."
-        return "Error", error_text, text_to_speech(error_text)
-
+        error_message = f"An error occurred in the pipeline: {str(e)}"
+        print(error_message)
+        user_error_text = "Sorry, I ran into a technical problem. Please try asking your question again."
+        error_audio = text_to_speech(user_error_text)
+        return "Error", user_error_text, error_audio
 import gradio.networking
 def get_dummy_ip():
     return "127.0.0.1"
 gradio.networking.get_local_ip_address = get_dummy_ip
 
-demo = gr.Blocks(theme=gr.themes.Soft(), css="footer {visibility: hidden}")
-with demo:
+with gr.Blocks(theme=gr.themes.Soft(), css="footer {visibility: hidden}") as demo:
     gr.Markdown("""
     <div style="text-align: center; padding: 20px; background-color: #f8f9fa; border-radius: 10px;">
         <h1 style="font-size: 2.5em; color: #343a40;">Real-Time V2V UnivestBot</h1>
         <p style="font-size: 1.2em; color: #6c757d;">Ask anything about Indian financial data using your voice.</p>
     </div>
     """)
+
     with gr.Row(equal_height=True):
         with gr.Column(scale=1):
             audio_input = gr.Audio(sources=["microphone"], type="filepath", label="Speak Your Financial Query")
             submit_btn = gr.Button("Get Answer", variant="primary")
-            status = gr.Textbox(label="Status", value="Ready", interactive=False)
+            status = gr.Textbox(label="Status", value="Ready for your query...", interactive=False)
 
         with gr.Column(scale=2):
             transcript = gr.Textbox(label="You Said", interactive=False)
@@ -331,15 +321,15 @@ with demo:
 
     def update_ui(audio_filepath):
         if not audio_filepath:
-            return "No audio.", "Please record something.", None, "Error"
-        status_msg = "Processing..."
+            return "No audio recorded.", "Please record your voice first.", None, "Error: No audio input."
+        status.value = "Processing your request..."
         transcript_val, reply_val, audio_val = chatbot_pipeline(audio_filepath)
-        return transcript_val, reply_val, audio_val, "Done"
+        status.value = "Done!"
+        return transcript_val, reply_val, audio_val, "Done!"
 
     submit_btn.click(
         fn=update_ui,
         inputs=[audio_input],
         outputs=[transcript, bot_response, audio_output, status]
     )
-
 demo.launch(share=False, server_name="127.0.0.1", server_port=7860)
